@@ -32,6 +32,13 @@ def generate_report(text, keywords, checklist_results, suggestions, page_type):
     report.append(f"Overall Score: {percentage:.1f}% ({status})")
     report.append("\n---\n")
 
+    # Content Preview
+    report.append("## Content Preview")
+    preview_length = min(300, len(text))
+    report.append(
+        f"```\n{text[:preview_length]}{'...' if len(text) > preview_length else ''}\n```")
+    report.append("\n---\n")
+
     # Keywords section
     report.append("## Target Keywords")
     for keyword in keywords[:10]:  # Show top 10 keywords
@@ -40,8 +47,41 @@ def generate_report(text, keywords, checklist_results, suggestions, page_type):
         report.append(f"- ... and {len(keywords) - 10} more")
     report.append("\n---\n")
 
-    # Checklist Results
-    report.append("## Evaluation Results")
+    # Score Summary Table
+    report.append("## Score Summary")
+    report.append("| Criteria | Score | Status |")
+    report.append("|----------|-------|--------|")
+
+    for item, result in checklist_results.items():
+        if isinstance(result, dict) and "score" in result:
+            score = result["score"]
+            item_name = item.replace("_", " ").title()
+
+            # Status indicator
+            if score >= 8:
+                status = "✅ Good"
+            elif score >= 5:
+                status = "⚠️ Needs Improvement"
+            else:
+                status = "❌ Poor"
+
+            report.append(f"| {item_name} | {score}/10 | {status} |")
+
+    report.append("\n---\n")
+
+    # Visual Score Chart
+    report.append("## Score Breakdown")
+    for item, result in checklist_results.items():
+        if isinstance(result, dict) and "score" in result:
+            score = result["score"]
+            item_name = item.replace("_", " ").title()[:20].ljust(20)
+            bar = "█" * score + "░" * (10 - score)
+            report.append(f"{item_name} |{bar}| {score}/10")
+
+    report.append("\n---\n")
+
+    # Detailed Checklist Results
+    report.append("## Detailed Evaluation Results")
 
     for item, result in checklist_results.items():
         if isinstance(result, dict) and "score" in result:
