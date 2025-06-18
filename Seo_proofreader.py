@@ -1,6 +1,5 @@
 import os
 import argparse
-import pandas as pd
 import re
 import json
 import openai
