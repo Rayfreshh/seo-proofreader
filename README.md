@@ -38,6 +38,7 @@ This SEO Proofreader tool evaluates content for SEO compliance, differentiating 
    ```bash
    OPENAI_API_KEY="your-openai-api-key"
    GOOGLE_CREDENTIALS='{"client_id":"...","client_secret":"...","refresh_token":"..."}'
+   ```
 
 4. Google Drive API setup:
 
@@ -49,10 +50,10 @@ Download the credentials JSON file
 Either set the environment variable:
    ```bash
    GOOGLE_APPLICATION_CREDENTIALS="/path/to/credentials.json"
-   ```
    or place the JSON file in the project directory.
 
-Usage
+## Usage
+Run the proofreader with a Google Document ID and its corresponding keyword sheet:
 Run the proofreader with a Google Document ID and its corresponding keyword sheet:
 ```bash
 python Seo_proofreader.py --doc_id DOCUMENT_ID --keywords_sheet SHEET_ID
@@ -62,20 +63,22 @@ Optionally specify the page type:
 python Seo_proofreader.py --doc_id DOCUMENT_ID --keywords_sheet SHEET_ID --page_type cost
 ```
 
-Parameters
---doc_id: The ID of the Google Doc to analyze (required)
---keywords_sheet: The ID of the Google Sheet containing keywords (required)
---page_type: Force the page type - either "cost" or "city" (optional, auto-detected if not provided)
-Output
+## Parameters
+- `--doc_id`: The ID of the Google Doc to analyze (required)
+- `--keywords_sheet`: The ID of the Google Sheet containing keywords (required)
+- `--page_type`: Force the page type - either "cost" or "city" (optional, auto-detected if not provided)
+
+## Output
 The tool will:
 
-Generate a Markdown report with the checklist scores
-Provide up to 5 improvement suggestions
-Save the report to a file named report_DOCUMENT_ID.md
-Test Documents
+- Generate a Markdown report with the checklist scores
+- Provide up to 5 improvement suggestions
+- Save the report to a file named `report_DOCUMENT_ID.md`
+
+## Test Documents
 The repository includes sample reports generated for the test documents:
 
-report_cost_page_1.md
-report_cost_page_2.md
-report_city_page_1.md
-report_city_page_2.md
+- `report_cost_page_1.md`
+- `report_cost_page_2.md`
+- `report_city_page_1.md`
+- `report_city_page_2.md`
