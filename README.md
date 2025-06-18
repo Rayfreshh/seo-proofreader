@@ -71,6 +71,7 @@ Enable the Google Docs API and Google Sheets API
 Create OAuth credentials (Desktop app)
 Download the credentials JSON file
 Save as token.json in the project directory:
+
 ```bash
 {
   "client_id": "YOUR_CLIENT_ID_HERE",
@@ -92,10 +93,6 @@ Optionally specify the page type:
 python Seo_proofreader.py --doc_id DOCUMENT_ID --keywords_sheet SHEET_ID --page_type cost
 ```
 
-Finding Document and Sheet IDs
-Google Docs: Extract from URL https://docs.google.com/document/d/[DOCUMENT_ID]/edit
-Google Sheets: Extract from URL https://docs.google.com/spreadsheets/d/[SHEET_ID]/edit
-
 ## Parameters
 - `--doc_id`: The ID of the Google Doc to analyze (required)
 - `--keywords_sheet`: The ID of the Google Sheet containing keywords (required)
@@ -108,5 +105,3 @@ The tool will:
 - Provide up to 5 improvement suggestions
 - Save the report to a file named `report_DOCUMENT_ID.md`
 
-## Test Documents
-The repository includes google sheets for testing purposes:
