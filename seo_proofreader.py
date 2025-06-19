@@ -30,8 +30,18 @@ ACCEPTABLE_SENTENCE_LENGTH = 20
 MIN_CONTENT_LENGTH = 400
 GOOD_CONTENT_LENGTH = 800
 
-# Initialize OpenAI client
-client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# With:
+client = None
+
+
+def get_openai_client():
+    """Get OpenAI client, initializing if needed."""
+    global client
+    if client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            client = openai.OpenAI(api_key=api_key)
+    return client
 
 
 class SEOEvaluationError(Exception):
@@ -178,7 +188,8 @@ def call_openai_evaluation(text: str, keywords: List[str], evaluation_type: str,
     Returns:
         OpenAI response or None if API unavailable
     """
-    if not client.api_key:
+    client = get_openai_client()
+    if not client or not client.api_key:
         print(
             f"OpenAI API key not found, using fallback for {evaluation_type}")
         return None
@@ -189,7 +200,7 @@ def call_openai_evaluation(text: str, keywords: List[str], evaluation_type: str,
         )
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -280,7 +291,8 @@ def detect_page_type_ai(text: str, keywords: Optional[List[str]] = None) -> str:
     Returns:
         Page type ('cost' or 'city')
     """
-    if not client.api_key:
+    client = get_openai_client()
+    if not client or not client.api_key:
         return _detect_page_type_fallback(text, keywords)
 
     try:
@@ -294,7 +306,7 @@ def detect_page_type_ai(text: str, keywords: Optional[List[str]] = None) -> str:
         )
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -779,7 +791,8 @@ def generate_ai_suggestions(text: str, keywords: List[str],
                             checklist_results: Dict[str, Any],
                             page_type: str) -> List[str]:
     """Generate improvement suggestions using AI."""
-    if not client.api_key:
+    client = get_openai_client()
+    if not client or not client.api_key:
         return _generate_improvement_suggestions_fallback(checklist_results, page_type)
 
     try:
@@ -811,7 +824,7 @@ def generate_ai_suggestions(text: str, keywords: List[str],
         )
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
@@ -893,7 +906,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if client.api_key:
+    client = get_openai_client()
+    if client and client.api_key:
         print("✓ OpenAI API key found - using AI-powered evaluation")
     else:
         print("⚠ OpenAI API key not found - using rule-based fallbacks")
