@@ -1,61 +1,123 @@
+"""
+SEO Proofreader Tool with AI Integration
+
+This module provides automated SEO content evaluation for cost pages and city pages
+using AI-powered analysis with rule-based fallbacks.
+"""
+
 import os
 import re
 import json
 import argparse
+from typing import Dict, List, Optional, Tuple, Any
+
 import openai
+from google.auth.exceptions import GoogleAuthError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 from report_generator import generate_report
 
-# Set OpenAI API key
-openai.api_key = os.environ.get("OPENAI_API_KEY")
+# Constants
+DEFAULT_SCORE = 5
+MAX_SCORE = 10
+PASS_THRESHOLD = 0.7
+KEYWORD_DENSITY_MIN = 1
+KEYWORD_DENSITY_MAX = 3
+MAX_SENTENCE_LENGTH = 15
+ACCEPTABLE_SENTENCE_LENGTH = 20
+MIN_CONTENT_LENGTH = 400
+GOOD_CONTENT_LENGTH = 800
+
+# Initialize OpenAI client
+client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
-def authenticate_google():
-    """Authenticate with Google API using OAuth credentials."""
-    # Check if credentials are stored in environment variable
+class SEOEvaluationError(Exception):
+    """Custom exception for SEO evaluation errors."""
+
+
+def authenticate_google() -> Tuple[Optional[Any], Optional[Any]]:
+    """
+    Authenticate with Google API using OAuth credentials.
+
+    Returns:
+        Tuple of (docs_service, sheets_service) or (None, None) if authentication fails.
+    """
     creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+
     if creds_json:
-        creds_data = json.loads(creds_json)
-        creds = Credentials.from_authorized_user_info(creds_data)
+        try:
+            creds_data = json.loads(creds_json)
+            creds = Credentials.from_authorized_user_info(creds_data)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing Google credentials: {e}")
+            return None, None
     else:
         # Try to load from token.json file
         try:
-            with open('token.json', 'r') as token_file:
+            with open('token.json', 'r', encoding='utf-8') as token_file:
                 creds_data = json.load(token_file)
                 creds = Credentials.from_authorized_user_info(creds_data)
         except FileNotFoundError:
-            print("Error: No credentials found. Please set up token.json or GOOGLE_CREDENTIALS environment variable.")
+            print("Error: No credentials found. Please set up token.json or "
+                  "GOOGLE_CREDENTIALS environment variable.")
+            return None, None
+        except json.JSONDecodeError as e:
+            print(f"Error parsing token.json: {e}")
             return None, None
 
-    # Build services
-    docs_service = build('docs', 'v1', credentials=creds)
-    sheets_service = build('sheets', 'v4', credentials=creds)
+    try:
+        docs_service = build('docs', 'v1', credentials=creds)
+        sheets_service = build('sheets', 'v4', credentials=creds)
+        return docs_service, sheets_service
+    except (GoogleAuthError, HttpError) as e:
+        print(f"Error building Google services: {e}")
+        return None, None
 
-    return docs_service, sheets_service
 
+def read_document(doc_id: str, service: Any) -> Optional[str]:
+    """
+    Read content from Google Doc.
 
-def read_document(doc_id, service):
-    """Read content from Google Doc."""
+    Args:
+        doc_id: Google Document ID
+        service: Google Docs service instance
+
+    Returns:
+        Document text content or None if error occurs
+    """
     try:
         document = service.documents().get(documentId=doc_id).execute()
         text_content = []
 
-        for content in document.get('body').get('content'):
+        body_content = document.get('body', {}).get('content', [])
+        for content in body_content:
             if 'paragraph' in content:
-                for element in content.get('paragraph').get('elements'):
+                elements = content.get('paragraph', {}).get('elements', [])
+                for element in elements:
                     if 'textRun' in element:
-                        text_content.append(
-                            element.get('textRun').get('content'))
+                        text_run = element.get('textRun', {})
+                        text_content.append(text_run.get('content', ''))
 
         return ''.join(text_content)
-    except Exception as e:
+    except (GoogleAuthError, HttpError) as e:
         print(f"Error reading Google Doc: {e}")
         return None
 
 
-def read_keyword_list(sheet_id, service):
-    """Read keywords from Google Sheet."""
+def read_keyword_list(sheet_id: str, service: Any) -> List[str]:
+    """
+    Read keywords from Google Sheet.
+
+    Args:
+        sheet_id: Google Sheet ID
+        service: Google Sheets service instance
+
+    Returns:
+        List of keywords or empty list if error occurs
+    """
     try:
         # Get sheet metadata to find the first sheet
         metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
@@ -68,7 +130,6 @@ def read_keyword_list(sheet_id, service):
         ).execute()
 
         values = result.get('values', [])
-
         if not values:
             return []
 
@@ -83,37 +144,206 @@ def read_keyword_list(sheet_id, service):
 
         # Extract keywords
         if keyword_col_idx is not None:
-            keywords = [row[keyword_col_idx] for row in values[1:] if len(
-                row) > keyword_col_idx and row[keyword_col_idx].strip()]
+            keywords = [
+                row[keyword_col_idx] for row in values[1:]
+                if (len(row) > keyword_col_idx and
+                    row[keyword_col_idx].strip())
+            ]
             return keywords
         else:
             # If no keyword column found, assume first column contains keywords
-            keywords = [row[0]
-                        for row in values[1:] if len(row) > 0 and row[0].strip()]
+            keywords = [
+                row[0] for row in values[1:]
+                if len(row) > 0 and row[0].strip()
+            ]
             return keywords
 
-    except Exception as e:
+    except (GoogleAuthError, HttpError) as e:
         print(f"Error reading keyword list: {e}")
         return []
 
 
-def detect_page_type(text, keywords=None):
-    """Detect if the page is a cost page or city page."""
+def call_openai_evaluation(text: str, keywords: List[str], evaluation_type: str,
+                           page_type: str, city_name: Optional[str] = None) -> Optional[str]:
+    """
+    Use OpenAI to evaluate content with fallback to rule-based approach.
+
+    Args:
+        text: Content to evaluate
+        keywords: List of target keywords
+        evaluation_type: Type of evaluation to perform
+        page_type: Type of page (cost or city)
+        city_name: Name of target city for city pages
+
+    Returns:
+        OpenAI response or None if API unavailable
+    """
+    if not client.api_key:
+        print(
+            f"OpenAI API key not found, using fallback for {evaluation_type}")
+        return None
+
+    try:
+        prompt = _construct_evaluation_prompt(
+            text, keywords, evaluation_type, page_type, city_name
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": ("You are an expert SEO content evaluator. "
+                                "Provide scores (1-10) and detailed explanations.")
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.3
+        )
+
+        return response.choices[0].message.content
+    except (openai.OpenAIError, openai.APIError, openai.RateLimitError) as e:
+        print(f"OpenAI API error for {evaluation_type}: {e}")
+        return None
+
+
+def _construct_evaluation_prompt(text: str, keywords: List[str], evaluation_type: str,
+                                 page_type: str, city_name: Optional[str] = None) -> str:
+    """
+    Construct specific prompts for different evaluation types.
+
+    Args:
+        text: Content to evaluate
+        keywords: List of target keywords
+        evaluation_type: Type of evaluation
+        page_type: Type of page
+        city_name: Name of target city
+
+    Returns:
+        Formatted prompt string
+    """
+    base_info = f"Content Type: {page_type.upper()} PAGE\n"
+    base_info += f"Target Keywords: {', '.join(keywords[:5])}\n"
+
+    if city_name:
+        base_info += f"Target City: {city_name}\n"
+
+    base_info += f"Content to evaluate (first 1000 chars): {text[:1000]}...\n\n"
+
+    prompts = {
+        "grammar_spelling": (
+            f"{base_info}Evaluate this content for grammar and spelling quality. "
+            "Score 1-10 and provide specific examples of issues found."
+        ),
+        "readability": (
+            f"{base_info}Evaluate readability and flow. Consider sentence length, "
+            "paragraph structure, and clarity. Score 1-10 with explanation."
+        ),
+        "keyword_usage": (
+            f"{base_info}Analyze keyword usage and density. Are keywords naturally "
+            "integrated? Is there keyword stuffing? Score 1-10."
+        ),
+        "content_structure": (
+            f"{base_info}Evaluate heading structure and content organization. "
+            "Are headings logical and SEO-friendly? Score 1-10."
+        ),
+        "seo_quality": (
+            f"{base_info}Overall SEO quality assessment. Consider title optimization, "
+            "meta-worthy content, and search intent matching. Score 1-10."
+        ),
+        "local_relevance": (
+            f"{base_info}For this city page, evaluate local relevance and "
+            "city-specific information quality. Score 1-10."
+        ),
+        "pricing_focus": (
+            f"{base_info}For this cost page, evaluate how well it focuses on "
+            "pricing information and cost-related content. Score 1-10."
+        )
+    }
+
+    return prompts.get(
+        evaluation_type,
+        f"{base_info}Evaluate this content for {evaluation_type}. "
+        "Score 1-10 with explanation."
+    )
+
+
+def detect_page_type_ai(text: str, keywords: Optional[List[str]] = None) -> str:
+    """
+    Use AI to detect page type with fallback to rule-based detection.
+
+    Args:
+        text: Content to analyze
+        keywords: Optional list of keywords
+
+    Returns:
+        Page type ('cost' or 'city')
+    """
+    if not client.api_key:
+        return _detect_page_type_fallback(text, keywords)
+
+    try:
+        keyword_text = ', '.join(keywords[:10]) if keywords else 'None'
+        prompt = (
+            "Analyze this content and determine if it's a COST page (focused on pricing) "
+            "or CITY page (focused on local services).\n\n"
+            f"Keywords: {keyword_text}\n"
+            f"Content (first 800 chars): {text[:800]}...\n\n"
+            "Respond with exactly one word: either 'cost' or 'city' followed by your reasoning."
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert at classifying web content types."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,
+            temperature=0.1
+        )
+
+        result = response.choices[0].message.content.lower()
+        if "cost" in result:
+            return "cost"
+        elif "city" in result:
+            return "city"
+        else:
+            return _detect_page_type_fallback(text, keywords)
+
+    except (openai.OpenAIError, openai.APIError, openai.RateLimitError) as e:
+        print(f"AI page type detection failed: {e}, using fallback")
+        return _detect_page_type_fallback(text, keywords)
+
+
+def _detect_page_type_fallback(text: str, keywords: Optional[List[str]] = None) -> str:
+    """
+    Fallback rule-based page type detection.
+
+    Args:
+        text: Content to analyze
+        keywords: Optional list of keywords
+
+    Returns:
+        Page type ('cost' or 'city')
+    """
     text_lower = text.lower()
 
-    # Cost page indicators
-    cost_indicators = ['price', 'cost', 'fee',
-                       'expense', 'tariff', '€', '$', 'kosten', 'prijs']
+    cost_indicators = [
+        'price', 'cost', 'fee', 'expense', 'tariff', '€', '$', 'kosten', 'prijs'
+    ]
+    city_indicators = [
+        'city', 'local', 'area', 'region', 'district', 'neighborhood'
+    ]
+
     cost_score = sum(
         1 for indicator in cost_indicators if indicator in text_lower)
-
-    # City page indicators
-    city_indicators = ['city', 'local', 'area',
-                       'region', 'district', 'neighborhood']
     city_score = sum(
         1 for indicator in city_indicators if indicator in text_lower)
 
-    # Check keywords for additional context
     if keywords:
         keyword_text = ' '.join(keywords).lower()
         cost_score += sum(1 for indicator in cost_indicators if indicator in keyword_text)
@@ -122,27 +352,266 @@ def detect_page_type(text, keywords=None):
     return "cost" if cost_score > city_score else "city"
 
 
-def evaluate_checklist(text, keywords, page_type):
-    """Evaluate content against the appropriate checklist."""
-    if page_type == "cost":
-        return evaluate_cost_page(text, keywords)
+def evaluate_with_ai_fallback(text: str, keywords: List[str], evaluation_type: str,
+                              page_type: str, city_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Evaluate using AI first, then fallback to rule-based if needed.
+
+    Args:
+        text: Content to evaluate
+        keywords: List of keywords
+        evaluation_type: Type of evaluation
+        page_type: Page type
+        city_name: City name for city pages
+
+    Returns:
+        Dictionary with score, details, and method used
+    """
+    # Try AI evaluation first
+    ai_result = call_openai_evaluation(
+        text, keywords, evaluation_type, page_type, city_name)
+
+    if ai_result:
+        score, details = _parse_ai_response(ai_result)
+        return {
+            "score": score,
+            "details": f"AI: {details}",
+            "method": "AI"
+        }
+
+    # Fallback to rule-based evaluation
+    return _evaluate_rule_based(text, keywords, evaluation_type, page_type, city_name)
+
+
+def _parse_ai_response(ai_response: str) -> Tuple[int, str]:
+    """
+    Parse AI response to extract score and explanation.
+
+    Args:
+        ai_response: Response from OpenAI API
+
+    Returns:
+        Tuple of (score, details)
+    """
+    try:
+        # Look for score patterns
+        score_patterns = [
+            r'(?:score|rating):\s*(\d+)',
+            r'(\d+)\/10',
+            r'(\d+)\s*out\s*of\s*10'
+        ]
+
+        score = DEFAULT_SCORE
+        for pattern in score_patterns:
+            match = re.search(pattern, ai_response.lower())
+            if match:
+                score = min(int(match.group(1)), MAX_SCORE)
+                break
+
+        # Clean up the response for details
+        details = ai_response.replace('\n', ' ').strip()[:200]
+        return score, details
+
+    except (ValueError, AttributeError) as e:
+        print(f"Error parsing AI response: {e}")
+        return DEFAULT_SCORE, ai_response[:100]
+
+
+def _evaluate_rule_based(text: str, keywords: List[str], evaluation_type: str,
+                         page_type: str, city_name: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Rule-based evaluation as fallback.
+
+    Args:
+        text: Content to evaluate
+        keywords: List of keywords
+        evaluation_type: Type of evaluation
+        page_type: Page type
+        city_name: City name for city pages
+
+    Returns:
+        Dictionary with score, details, and method
+    """
+    evaluation_map = {
+        "grammar_spelling": _evaluate_grammar_spelling_fallback,
+        "readability": _evaluate_readability_fallback,
+        "keyword_usage": lambda t, k, *args: _evaluate_keyword_usage_fallback(t, k),
+        "content_structure": lambda t, *args: _evaluate_structure_fallback(t),
+        "local_relevance": lambda t, k, pt, cn: _evaluate_local_relevance_fallback(t, cn),
+        "pricing_focus": lambda t, *args: _evaluate_pricing_focus_fallback(t)
+    }
+
+    if evaluation_type in evaluation_map:
+        return evaluation_map[evaluation_type](text, keywords, page_type, city_name)
+
+    return {
+        "score": DEFAULT_SCORE,
+        "details": "Fallback evaluation",
+        "method": "Rule-based"
+    }
+
+
+def _evaluate_grammar_spelling_fallback(text: str, keywords: List[str],
+                                        page_type: str, city_name: Optional[str]) -> Dict[str, Any]:
+    """Fallback grammar evaluation."""
+    _ = keywords, page_type, city_name
+
+    issues = 0
+    issues += text.count('  ')
+    issues += len(re.findall(r'[a-z]\.[A-Z]', text))
+    issues += len(re.findall(r'\s+[,.!?]', text))
+
+    score = max(1, MAX_SCORE - issues)
+    return {
+        "score": score,
+        "details": f"Rule-based: Found {issues} potential grammar/spacing issues",
+        "method": "Rule-based"
+    }
+
+
+def _evaluate_readability_fallback(text: str, keywords: List[str],
+                                   page_type: str, city_name: Optional[str]) -> Dict[str, Any]:
+    """Fallback readability evaluation."""
+    _ = keywords, page_type, city_name
+
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    avg_sentence_length = (
+        sum(len(s.split()) for s in sentences) / len(sentences)
+        if sentences else 0
+    )
+
+    if avg_sentence_length <= MAX_SENTENCE_LENGTH:
+        score = 9
+        details = "Excellent sentence length for readability"
+    elif avg_sentence_length <= ACCEPTABLE_SENTENCE_LENGTH:
+        score = 7
+        details = "Good sentence length"
     else:
-        # Extract city name for city pages
-        city_name = extract_city_name(text, keywords)
-        return evaluate_city_page(text, keywords, city_name)
+        score = 4
+        details = "Sentences too long for optimal readability"
+
+    return {
+        "score": score,
+        "details": (f"Rule-based: {details} "
+                    f"(avg: {avg_sentence_length:.1f} words/sentence)"),
+        "method": "Rule-based"
+    }
 
 
-def extract_city_name(text, keywords):
+def _evaluate_keyword_usage_fallback(text: str, keywords: List[str]) -> Dict[str, Any]:
+    """Fallback keyword evaluation."""
+    if not keywords:
+        return {
+            "score": DEFAULT_SCORE,
+            "details": "No keywords provided",
+            "method": "Rule-based"
+        }
+
+    keyword_density = _calculate_keyword_density(text, keywords)
+
+    if KEYWORD_DENSITY_MIN <= keyword_density <= KEYWORD_DENSITY_MAX:
+        score = 8
+        details = "Good keyword density"
+    elif keyword_density < KEYWORD_DENSITY_MIN:
+        score = 4
+        details = "Keyword density too low"
+    else:
+        score = 3
+        details = "Possible keyword stuffing"
+
+    return {
+        "score": score,
+        "details": f"Rule-based: {details} ({keyword_density:.1f}%)",
+        "method": "Rule-based"
+    }
+
+
+def _evaluate_structure_fallback(text: str) -> Dict[str, Any]:
+    """Fallback structure evaluation."""
+    h1_count = len(re.findall(r'<h1[^>]*>', text, re.IGNORECASE))
+    h2_count = len(re.findall(r'<h2[^>]*>', text, re.IGNORECASE))
+    h3_count = len(re.findall(r'<h3[^>]*>', text, re.IGNORECASE))
+
+    score = DEFAULT_SCORE
+    details = []
+
+    if h1_count == 1:
+        score += 2
+        details.append("Good H1 usage")
+    elif h1_count == 0:
+        details.append("Missing H1")
+    else:
+        details.append("Multiple H1s found")
+
+    if h2_count >= 2:
+        score += 2
+        details.append("Good H2 structure")
+
+    if h3_count > 0:
+        score += 1
+        details.append("Has H3 subheadings")
+
+    return {
+        "score": min(score, MAX_SCORE),
+        "details": f"Rule-based: {'; '.join(details)}",
+        "method": "Rule-based"
+    }
+
+
+def _evaluate_local_relevance_fallback(text: str, city_name: Optional[str]) -> Dict[str, Any]:
+    """Fallback local relevance evaluation."""
+    if not city_name or city_name == "Unknown City":
+        return {
+            "score": 3,
+            "details": "City name not identified",
+            "method": "Rule-based"
+        }
+
+    city_mentions = text.lower().count(city_name.lower())
+    local_terms = ['local', 'nearby', 'area', 'district', 'region']
+    local_score = sum(1 for term in local_terms if term in text.lower())
+
+    score = min(MAX_SCORE, city_mentions + local_score)
+
+    return {
+        "score": score,
+        "details": (f"Rule-based: {city_mentions} city mentions, "
+                    f"{local_score} local terms"),
+        "method": "Rule-based"
+    }
+
+
+def _evaluate_pricing_focus_fallback(text: str) -> Dict[str, Any]:
+    """Fallback pricing focus evaluation."""
+    price_terms = ['cost', 'price', 'fee', 'expense', '€', '$']
+    price_score = sum(1 for term in price_terms if term in text.lower())
+
+    price_patterns = [r'€\s*\d+', r'\$\s*\d+', r'price.*\d+']
+    pattern_matches = sum(
+        1 for pattern in price_patterns
+        if re.search(pattern, text, re.IGNORECASE)
+    )
+
+    score = min(MAX_SCORE, price_score + pattern_matches)
+
+    return {
+        "score": score,
+        "details": (f"Rule-based: {price_score} price terms, "
+                    f"{pattern_matches} price patterns"),
+        "method": "Rule-based"
+    }
+
+
+def extract_city_name(text: str, keywords: List[str]) -> str:
     """Extract city name from keywords or text."""
-    # Try to find city name in keywords first
     for keyword in keywords:
-        # Look for patterns like "service in CityName"
         city_match = re.search(
-            r'\b(?:in|te)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', keyword)
+            r'\b(?:in|te)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+            keyword
+        )
         if city_match:
             return city_match.group(1)
 
-    # Fallback: look in text for common patterns
     city_patterns = [
         r'\b(?:in|te)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
         r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:area|region|city)'
@@ -156,218 +625,75 @@ def extract_city_name(text, keywords):
     return "Unknown City"
 
 
-def evaluate_cost_page(text, keywords):
-    """Evaluate a cost page against the cost-specific SEO checklist."""
+def evaluate_checklist(text: str, keywords: List[str], page_type: str) -> Dict[str, Any]:
+    """Evaluate content against the appropriate checklist."""
+    if page_type == "cost":
+        return _evaluate_cost_page(text, keywords)
+    else:
+        city_name = extract_city_name(text, keywords)
+        return _evaluate_city_page(text, keywords, city_name)
+
+
+def _evaluate_cost_page(text: str, keywords: List[str]) -> Dict[str, Any]:
+    """Evaluate a cost page using AI with fallbacks."""
     results = {}
 
-    # 1. Page Title and Meta Description
-    results["page_title_meta"] = evaluate_title_meta(text, keywords)
+    evaluation_types = [
+        "grammar_spelling", "readability", "keyword_usage",
+        "content_structure", "seo_quality", "pricing_focus"
+    ]
 
-    # 2. Headings and Keywords
-    results["headings_keywords"] = evaluate_headings_keywords_cost(
-        text, keywords)
+    for eval_type in evaluation_types:
+        results[eval_type] = evaluate_with_ai_fallback(
+            text, keywords, eval_type, "cost"
+        )
 
-    # 3. Internal Linking
-    results["internal_linking"] = evaluate_internal_linking(text)
-
-    # 4. General Quality
-    results["general_quality"] = evaluate_general_quality(text)
-
-    # 5. Tone and Readability
-    results["tone_readability"] = evaluate_tone_readability(text)
-
-    # 6. Formatting Guidelines
-    results["formatting"] = evaluate_formatting(text)
-
-    # 7. Cost Page Specific
-    results["cost_specific"] = evaluate_cost_specific_features(text)
-
-    # 8. FAQ Section
-    results["faq_section"] = evaluate_faq_section(text)
+    results["internal_linking"] = _evaluate_internal_linking(text)
+    results["formatting"] = _evaluate_formatting(text)
 
     return results
 
 
-def evaluate_city_page(text, keywords, city_name):
-    """Evaluate a city page against the city-specific SEO checklist."""
+def _evaluate_city_page(text: str, keywords: List[str], city_name: str) -> Dict[str, Any]:
+    """Evaluate a city page using AI with fallbacks."""
     results = {}
 
-    # 1. Headings and Keywords (City-specific)
-    results["headings_keywords"] = evaluate_headings_keywords_city(
-        text, keywords, city_name)
+    evaluation_types = [
+        "grammar_spelling", "readability", "keyword_usage",
+        "content_structure", "seo_quality", "local_relevance"
+    ]
 
-    # 2. Internal Linking
-    results["internal_linking"] = evaluate_internal_linking(text)
+    for eval_type in evaluation_types:
+        results[eval_type] = evaluate_with_ai_fallback(
+            text, keywords, eval_type, "city", city_name
+        )
 
-    # 3. General Quality (City-specific)
-    results["general_quality"] = evaluate_general_quality_city(text, city_name)
-
-    # 4. Tone and Readability
-    results["tone_readability"] = evaluate_tone_readability(text)
-
-    # 5. Formatting Guidelines
-    results["formatting"] = evaluate_formatting(text)
-
-    # 6. City-Specific Features
-    results["city_specific"] = evaluate_city_specific_features(text, city_name)
+    results["internal_linking"] = _evaluate_internal_linking(text)
+    results["formatting"] = _evaluate_formatting(text)
 
     return results
 
 
-def evaluate_title_meta(text, keywords):
-    """Evaluate page title and meta description."""
-    score = 5  # Base score
-    details = []
-
-    # Extract title (simplified - assumes first line or H1)
-    title_match = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.IGNORECASE)
-    if title_match:
-        title = title_match.group(1)
-        main_keyword = keywords[0] if keywords else ""
-
-        if main_keyword.lower() in title.lower():
-            score += 3
-            details.append("✓ Main keyword found in title")
-        else:
-            details.append("✗ Main keyword missing from title")
-
-        if '|' in title:
-            score += 2
-            details.append("✓ Good title structure with separators")
-    else:
-        details.append("✗ No H1 title found")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_headings_keywords_cost(text, keywords):
-    """Evaluate headings and keywords for cost pages."""
-    score = 0
-    details = []
-
-    # Extract headings
-    h1_pattern = re.compile(r'<h1[^>]*>(.*?)</h1>', re.IGNORECASE)
-    h2_pattern = re.compile(r'<h2[^>]*>(.*?)</h2>', re.IGNORECASE)
-    h3_pattern = re.compile(r'<h3[^>]*>(.*?)</h3>', re.IGNORECASE)
-
-    h1_tags = h1_pattern.findall(text)
-    h2_tags = h2_pattern.findall(text)
-    h3_tags = h3_pattern.findall(text)
-
-    main_keyword = keywords[0] if keywords else ""
-
-    # Check H1 matches main keyword exactly
-    if h1_tags and main_keyword.lower() in h1_tags[0].lower():
-        score += 3
-        details.append("✓ H1 contains main keyword")
-    else:
-        details.append("✗ H1 should match main keyword exactly")
-
-    # Check keyword placement naturalness
-    keyword_density = calculate_keyword_density(text, keywords)
-    if 1 <= keyword_density <= 3:
-        score += 2
-        details.append("✓ Natural keyword placement")
-    else:
-        details.append("✗ Keyword density issues (should be 1-3%)")
-
-    # Check subtopic coverage
-    if len(h2_tags) >= 3:
-        score += 2
-        details.append("✓ Good subtopic coverage with H2s")
-
-    # Check FAQ coverage
-    faq_keywords = [kw for kw in keywords if any(
-        q in kw.lower() for q in ['what', 'how', 'why', 'when', 'where'])]
-    if len(faq_keywords) > 0:
-        score += 2
-        details.append("✓ FAQ-style keywords present")
-
-    # Check spelling priorities
-    score += 1
-    details.append("✓ Assuming correct spelling used")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_headings_keywords_city(text, keywords, city_name):
-    """Evaluate headings and keywords for city pages."""
-    score = 0
-    details = []
-
-    # Extract headings
-    h2_pattern = re.compile(r'<h2[^>]*>(.*?)</h2>', re.IGNORECASE)
-    h2_tags = h2_pattern.findall(text)
-
-    # Check H2s include city and CTA
-    h2_with_city = sum(1 for h2 in h2_tags if city_name.lower() in h2.lower())
-    cta_words = ['find', 'compare', 'discover',
-                 'best', 'top', 'reliable', 'professional']
-    h2_with_cta = sum(1 for h2 in h2_tags if any(
-        cta in h2.lower() for cta in cta_words))
-
-    if h2_with_city > 0 and h2_with_cta > 0:
-        score += 3
-        details.append("✓ H2s include city name and CTA language")
-    elif h2_with_city > 0:
-        score += 2
-        details.append("△ H2s include city but need more CTA language")
-    else:
-        details.append("✗ H2s should include city name and action words")
-
-    # Check city-focused keywords
-    city_focused_keywords = sum(
-        1 for kw in keywords if city_name.lower() in kw.lower())
-    if city_focused_keywords >= len(keywords) * 0.7:
-        score += 2
-        details.append("✓ Most keywords are city-focused")
-    else:
-        details.append("✗ More keywords should be city-specific")
-
-    # Check keyword placement
-    keyword_density = calculate_keyword_density(text, keywords)
-    if 1 <= keyword_density <= 3:
-        score += 2
-        details.append("✓ Natural keyword placement")
-    else:
-        details.append("✗ Keyword density issues")
-
-    # Check subtopic coverage
-    if len(h2_tags) >= 3:
-        score += 2
-        details.append("✓ Good subtopic structure")
-
-    # Check logical heading structure
-    score += 1
-    details.append("✓ Assuming logical heading flow")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_internal_linking(text):
+def _evaluate_internal_linking(text: str) -> Dict[str, Any]:
     """Evaluate internal linking strategy."""
     score = 0
     details = []
 
-    # Extract links
     link_pattern = re.compile(
-        r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.IGNORECASE)
+        r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        re.IGNORECASE
+    )
     links = link_pattern.findall(text)
 
-    # Count different types of links
-    top10_links = sum(1 for _, link_text in links if "top 10" in link_text.lower(
-    ) or "top ten" in link_text.lower())
-    cost_links = sum(1 for _, link_text in links if any(
-        word in link_text.lower() for word in ["cost", "price", "kosten", "prijs"]))
+    top10_links = sum(
+        1 for _, link_text in links
+        if "top 10" in link_text.lower() or "top ten" in link_text.lower()
+    )
+    cost_links = sum(
+        1 for _, link_text in links
+        if any(word in link_text.lower()
+               for word in ["cost", "price", "kosten", "prijs"])
+    )
 
     if top10_links >= 2:
         score += 4
@@ -384,520 +710,235 @@ def evaluate_internal_linking(text):
     else:
         details.append("✗ Should link to relevant cost pages")
 
-    # Check for nearby cities (city pages)
-    nearby_links = sum(1 for _, link_text in links if any(
-        word in link_text.lower() for word in ["nearby", "other cities", "region"]))
+    nearby_links = sum(
+        1 for _, link_text in links
+        if any(word in link_text.lower()
+               for word in ["nearby", "other cities", "region"])
+    )
     if nearby_links > 0:
         score += 2
         details.append("✓ Links to nearby locations")
 
-    # General link quantity
     if len(links) >= 5:
         score += 1
         details.append("✓ Good internal linking quantity")
 
     return {
-        "score": min(score, 10),
+        "score": min(score, MAX_SCORE),
         "details": "; ".join(details)
     }
 
 
-def evaluate_general_quality(text):
-    """Evaluate general content quality."""
-    score = 0
-    details = []
-
-    # Check introduction length
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    if paragraphs and len(paragraphs[0].split('.')) <= 3:
-        score += 1
-        details.append("✓ Concise introduction")
-    else:
-        details.append("✗ Introduction should be one paragraph")
-
-    # Check for redundancy (simplified)
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    unique_ratio = len(set(sentences)) / len(sentences) if sentences else 0
-    if unique_ratio > 0.9:
-        score += 2
-        details.append("✓ No redundant information")
-    else:
-        details.append("△ Some content may be redundant")
-
-    # Check content value (word count as proxy)
-    word_count = len(text.split())
-    if word_count >= 800:
-        score += 2
-        details.append("✓ Comprehensive content")
-    elif word_count >= 400:
-        score += 1
-        details.append("△ Adequate content length")
-    else:
-        details.append("✗ Content too brief")
-
-    # Check for CTAs
-    cta_patterns = ['compare', 'contact', 'get quote', 'find', 'choose']
-    cta_count = sum(1 for pattern in cta_patterns if pattern in text.lower())
-    if cta_count >= 2:
-        score += 2
-        details.append("✓ Good CTA usage")
-    elif cta_count >= 1:
-        score += 1
-        details.append("△ Has CTAs but could add more")
-
-    # Check Trustoo/Trustlocal value proposition
-    brand_value = any(term in text.lower() for term in [
-                      'trustoo', 'trustlocal', 'verified', 'checked', 'quality marks'])
-    if brand_value:
-        score += 2
-        details.append("✓ Brand value proposition present")
-    else:
-        details.append("✗ Should emphasize Trustoo/Trustlocal value")
-
-    # General quality assumption
-    score += 1
-    details.append("✓ Assuming good spelling and grammar")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_general_quality_city(text, city_name):
-    """Evaluate general quality for city pages with city-specific checks."""
-    result = evaluate_general_quality(text)
-
-    # Add city-specific quality checks
-    score = result["score"]
-    details = result["details"].split("; ")
-
-    # Check for local business advantages
-    local_advantages = any(term in text.lower() for term in [
-                           "local", "nearby", "travel expense", "quick response", "familiar with area"])
-    if local_advantages:
-        score = min(score + 1, 10)
-        details.append("✓ Emphasizes local business advantages")
-    else:
-        details.append("✗ Should emphasize local business advantages")
-
-    # Check for city districts
-    districts_mentioned = any(term in text.lower() for term in [
-                              "district", "area", "neighborhood", "region", city_name.lower()])
-    if districts_mentioned:
-        score = min(score + 1, 10)
-        details.append("✓ Mentions city areas/districts")
-    else:
-        details.append("✗ Should mention city districts naturally")
-
-    # Check for cost paragraph
-    cost_paragraph = any(para for para in text.split('\n\n') if any(
-        term in para.lower() for term in ["cost", "price", "fee"]))
-    if cost_paragraph:
-        score = min(score + 1, 10)
-        details.append("✓ Includes cost information")
-    else:
-        details.append("✗ Should include cost paragraph")
-
-    return {
-        "score": score,
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_tone_readability(text):
-    """Evaluate tone of voice and readability."""
-    score = 0
-    details = []
-
-    # Check sentence length
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    avg_sentence_length = sum(len(s.split())
-                              for s in sentences) / len(sentences) if sentences else 0
-
-    if avg_sentence_length <= 15:
-        score += 3
-        details.append("✓ Good sentence length")
-    elif avg_sentence_length <= 20:
-        score += 2
-        details.append("△ Acceptable sentence length")
-    else:
-        details.append("✗ Sentences too long")
-
-    # Check for exclamation marks
-    exclamation_count = text.count("!")
-    if exclamation_count == 0:
-        score += 2
-        details.append("✓ No exclamation marks")
-    elif exclamation_count <= 2:
-        score += 1
-        details.append("△ Few exclamation marks")
-    else:
-        details.append("✗ Too many exclamation marks")
-
-    # Check for bold formatting
-    bold_count = len(re.findall(
-        r'<(strong|b)[^>]*>.*?</(strong|b)>', text, re.IGNORECASE))
-    if bold_count >= 3:
-        score += 2
-        details.append("✓ Good use of bold formatting")
-    elif bold_count >= 1:
-        score += 1
-        details.append("△ Some bold formatting")
-    else:
-        details.append("✗ Should use bold for key information")
-
-    # Check paragraph length
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    avg_paragraph_length = sum(
-        len(p.split()) for p in paragraphs) / len(paragraphs) if paragraphs else 0
-    if avg_paragraph_length <= 50:
-        score += 2
-        details.append("✓ Short, scannable paragraphs")
-    elif avg_paragraph_length <= 80:
-        score += 1
-        details.append("△ Acceptable paragraph length")
-
-    # Check for tentative words
-    tentative_words = ['maybe', 'perhaps', 'possibly', 'might']
-    tentative_count = sum(
-        1 for word in tentative_words if word in text.lower())
-    if tentative_count == 0:
-        score += 1
-        details.append("✓ No tentative language")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_formatting(text):
+def _evaluate_formatting(text: str) -> Dict[str, Any]:
     """Evaluate formatting and specific guidelines."""
-    score = 5  # Base score
+    score = DEFAULT_SCORE
     details = []
 
-    # Check price formatting
     price_patterns = [r'€\s*\d+,-', r'€\s*\d+\.\d+,-', r'€\s*\d+,\d+']
     correct_prices = sum(
-        1 for pattern in price_patterns if re.search(pattern, text))
+        1 for pattern in price_patterns
+        if re.search(pattern, text)
+    )
     if correct_prices > 0:
         score += 2
         details.append("✓ Correct price formatting")
 
-    # Check percentage formatting
     if re.search(r'\d+%', text):
         score += 1
         details.append("✓ Correct percentage formatting")
 
-    # Check number formatting (simplified)
-    # This would need more sophisticated checking in practice
     score += 1
     details.append("✓ Assuming correct number formatting")
 
-    # Check bullet point formatting
     bullet_patterns = [r'^\s*[-•*]\s+', r'^\s*\d+\.\s+']
     if any(re.search(pattern, text, re.MULTILINE) for pattern in bullet_patterns):
         score += 1
         details.append("✓ Has formatted bullet points")
 
     return {
-        "score": min(score, 10),
+        "score": min(score, MAX_SCORE),
         "details": "; ".join(details)
     }
 
 
-def evaluate_cost_specific_features(text):
-    """Evaluate cost page specific features."""
-    score = 0
-    details = []
-
-    # Check for tables
-    table_indicators = ['<table', '|', 'cost', 'price', 'service']
-    table_score = sum(
-        1 for indicator in table_indicators if indicator in text.lower())
-    if table_score >= 3:
-        score += 3
-        details.append("✓ Contains cost tables")
-    elif table_score >= 1:
-        score += 1
-        details.append("△ Some table elements present")
-    else:
-        details.append("✗ Should include cost tables")
-
-    # Check price realism (simplified - checks for reasonable ranges)
-    price_matches = re.findall(r'€\s*(\d+)', text)
-    if price_matches:
-        prices = [int(p) for p in price_matches]
-        if all(10 <= p <= 10000 for p in prices):
-            score += 2
-            details.append("✓ Realistic price ranges")
-        else:
-            details.append("△ Check price realism")
-
-    # Check pricing focus
-    pricing_keywords = ['cost', 'price', 'fee', 'tariff', 'rate', 'expense']
-    pricing_focus = sum(
-        1 for keyword in pricing_keywords if keyword in text.lower())
-    if pricing_focus >= 5:
-        score += 3
-        details.append("✓ Strong pricing focus")
-    elif pricing_focus >= 2:
-        score += 2
-        details.append("△ Some pricing focus")
-
-    # Check CTA button considerations
-    cta_buttons = re.findall(
-        r'<button[^>]*>(.*?)</button>', text, re.IGNORECASE)
-    short_ctas = [cta for cta in cta_buttons if len(cta) <= 20]
-    if len(short_ctas) >= len(cta_buttons) * 0.8:
-        score += 2
-        details.append("✓ Mobile-friendly CTA buttons")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_faq_section(text):
-    """Evaluate FAQ section quality."""
-    score = 0
-    details = []
-
-    # Check for FAQ presence
-    faq_indicators = ['faq', 'frequently asked',
-                      'questions', 'what is', 'how to', 'why']
-    faq_count = sum(
-        1 for indicator in faq_indicators if indicator in text.lower())
-
-    if faq_count >= 3:
-        score += 3
-        details.append("✓ FAQ section present")
-
-        # Check for specific headings
-        generic_faq = text.lower().count('faq')
-        if generic_faq <= 1:
-            score += 2
-            details.append("✓ Specific FAQ headings")
-        else:
-            details.append("△ Avoid generic 'FAQ' titles")
-
-        # Check for intro text
-        if 'questions' in text.lower() and 'answers' in text.lower():
-            score += 2
-            details.append("✓ FAQ introduction present")
-
-        # Check for question format
-        question_patterns = [r'what\s+is', r'how\s+to',
-                             r'why\s+', r'when\s+', r'where\s+']
-        question_count = sum(1 for pattern in question_patterns if re.search(
-            pattern, text, re.IGNORECASE))
-        if question_count >= 3:
-            score += 3
-            details.append("✓ Good question variety")
-        elif question_count >= 1:
-            score += 1
-            details.append("△ Some questions present")
-    else:
-        details.append("✗ FAQ section missing or minimal")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def evaluate_city_specific_features(text, city_name):
-    """Evaluate city-specific features."""
-    score = 0
-    details = []
-
-    # Check city name frequency
-    city_mentions = text.lower().count(city_name.lower())
-    text_length = len(text.split())
-    city_density = (city_mentions / text_length *
-                    100) if text_length > 0 else 0
-
-    if 0.5 <= city_density <= 2:
-        score += 3
-        details.append("✓ Good city name frequency")
-    elif city_mentions > 0:
-        score += 1
-        details.append("△ City mentioned but check frequency")
-    else:
-        details.append("✗ City name rarely mentioned")
-
-    # Check for local advantages
-    local_terms = ['local', 'nearby', 'close',
-                   'area', 'region', 'travel', 'quick response']
-    local_score = sum(1 for term in local_terms if term in text.lower())
-    if local_score >= 3:
-        score += 2
-        details.append("✓ Emphasizes local advantages")
-    elif local_score >= 1:
-        score += 1
-        details.append("△ Some local advantages mentioned")
-
-    # Check for professional/city-specific information
-    professional_terms = ['specialized', 'familiar',
-                          'experienced', 'local expertise', 'regulations']
-    prof_score = sum(1 for term in professional_terms if term in text.lower())
-    if prof_score >= 2:
-        score += 2
-        details.append("✓ Professional city-specific info")
-
-    # Check for districts/areas
-    area_terms = ['district', 'neighborhood', 'area', 'zone', 'sector']
-    area_score = sum(1 for term in area_terms if term in text.lower())
-    if area_score >= 1:
-        score += 2
-        details.append("✓ Mentions city areas/districts")
-    else:
-        details.append("✗ Should mention city districts")
-
-    # Check for cost information
-    cost_terms = ['cost', 'price', 'fee', 'expense']
-    cost_mentions = sum(1 for term in cost_terms if term in text.lower())
-    if cost_mentions >= 2:
-        score += 1
-        details.append("✓ Includes cost information")
-
-    return {
-        "score": min(score, 10),
-        "details": "; ".join(details)
-    }
-
-
-def calculate_keyword_density(text, keywords):
+def _calculate_keyword_density(text: str, keywords: List[str]) -> float:
     """Calculate keyword density percentage."""
     if not keywords:
-        return 0
+        return 0.0
 
     word_count = len(text.split())
-    keyword_count = sum(text.lower().count(keyword.lower())
-                        for keyword in keywords)
+    keyword_count = sum(
+        text.lower().count(keyword.lower())
+        for keyword in keywords
+    )
 
-    return (keyword_count / word_count * 100) if word_count > 0 else 0
+    return (keyword_count / word_count * 100) if word_count > 0 else 0.0
 
 
-def generate_improvement_suggestions(text, keywords, checklist_results, page_type):
-    """Generate improvement suggestions based on evaluation results."""
+def generate_ai_suggestions(text: str, keywords: List[str],
+                            checklist_results: Dict[str, Any],
+                            page_type: str) -> List[str]:
+    """Generate improvement suggestions using AI."""
+    if not client.api_key:
+        return _generate_improvement_suggestions_fallback(checklist_results, page_type)
+
+    try:
+        low_scores = [
+            (item, result["score"])
+            for item, result in checklist_results.items()
+            if isinstance(result, dict)
+            and "score" in result
+            and result["score"] < 7
+        ]
+
+        problem_areas = [
+            item.replace("_", " ")
+            for item, score in low_scores
+        ]
+
+        prompt = (
+            f"Based on this SEO evaluation of a {page_type} page, provide exactly 5 "
+            "specific, actionable improvement suggestions.\n\n"
+            f"Problem areas identified: {', '.join(problem_areas)}\n"
+            f"Keywords: {', '.join(keywords[:5])}\n"
+            f"Content sample: {text[:500]}...\n\n"
+            "Provide 5 numbered suggestions that are:\n"
+            "1. Specific and actionable\n"
+            "2. Focused on the lowest-scoring areas\n"
+            "3. SEO-focused\n"
+            "4. Realistic to implement\n\n"
+            "Format as:\n1. [suggestion]\n2. [suggestion]\n...etc"
+        )
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": ("You are an expert SEO consultant providing "
+                                "actionable improvement advice.")
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=400,
+            temperature=0.5
+        )
+
+        suggestions_text = response.choices[0].message.content
+        suggestions = []
+
+        for line in suggestions_text.split('\n'):
+            if re.match(r'^\d+\.', line.strip()):
+                suggestion = re.sub(r'^\d+\.\s*', '', line.strip())
+                if suggestion:
+                    suggestions.append(suggestion)
+
+        return suggestions[:5]
+
+    except (openai.OpenAIError, openai.APIError, openai.RateLimitError) as e:
+        print(f"AI suggestion generation failed: {e}, using fallback")
+        return _generate_improvement_suggestions_fallback(checklist_results, page_type)
+
+
+def _generate_improvement_suggestions_fallback(checklist_results: Dict[str, Any],
+                                               _page_type: str) -> List[str]:
+    """Fallback suggestion generation."""
     suggestions = []
 
-    # Find lowest scoring items
-    low_scores = [(item, result) for item, result in checklist_results.items()
-                  if isinstance(result, dict) and "score" in result and result["score"] < 7]
-
-    # Sort by lowest score first
-    low_scores.sort(key=lambda x: x[1]["score"])
-
-    # Generate targeted suggestions
-    for item, result in low_scores[:5]:  # Top 5 lowest scores
-        if item == "headings_keywords":
-            if page_type == "city":
-                suggestions.append(
-                    f"Improve H2 headings by including action words like 'Find' or 'Compare' along with location-specific keywords.")
-            else:
-                suggestions.append(
-                    "Ensure H1 matches the main keyword exactly and use high-volume keywords naturally in subheadings.")
-
-        elif item == "internal_linking":
-            suggestions.append(
-                "Add more internal links to Top 10 pages and relevant cost pages to improve navigation and SEO value.")
-
-        elif item == "general_quality":
-            suggestions.append(
-                "Improve content quality by making the introduction more concise and ensuring each paragraph adds unique value.")
-
-        elif item == "tone_readability":
-            suggestions.append(
-                "Improve readability by using shorter sentences, avoiding exclamation marks, and using bold formatting for key information.")
-
-        elif item == "formatting":
-            suggestions.append(
-                "Follow formatting guidelines: use € 150,- for prices, write numbers up to 20 in words, and format bullet points correctly.")
-
-        elif item == "cost_specific":
-            suggestions.append(
-                "Add cost tables at the top of sections with realistic prices and ensure all information relates to pricing.")
-
-        elif item == "city_specific":
-            suggestions.append(
-                "Include more city-specific information such as local business advantages and mentions of city districts.")
-
-        elif item == "faq_section":
-            suggestions.append(
-                "Add a comprehensive FAQ section with specific headings and high search volume questions.")
-
-    # Fill remaining slots with general suggestions if needed
-    general_suggestions = [
-        "Optimize keyword density to 1-3% for natural placement without stuffing.",
-        "Include more CTAs encouraging users to compare multiple service providers.",
-        "Emphasize the added value of Trustoo/Trustlocal platform features.",
-        "Ensure content answers all questions a user might have about the topic.",
-        "Compare with top Google search results to ensure competitive content quality."
+    low_scores = [
+        (item, result) for item, result in checklist_results.items()
+        if isinstance(result, dict) and "score" in result and result["score"] < 7
     ]
 
-    for suggestion in general_suggestions:
-        if len(suggestions) < 5 and suggestion not in suggestions:
-            suggestions.append(suggestion)
+    low_scores.sort(key=lambda x: x[1]["score"])
 
-    return suggestions[:5]
+    suggestion_map = {
+        "grammar_spelling": ("Review and correct grammar and spelling errors "
+                             "throughout the content"),
+        "readability": ("Improve readability by using shorter sentences "
+                        "and simpler language"),
+        "keyword_usage": ("Optimize keyword placement and density "
+                          "for better SEO performance"),
+        "content_structure": "Improve heading structure and content organization",
+        "seo_quality": ("Enhance overall SEO elements including title "
+                        "and meta descriptions"),
+        "local_relevance": ("Add more city-specific information "
+                            "and local business advantages"),
+        "pricing_focus": ("Strengthen focus on pricing information "
+                          "and cost-related content")
+    }
+
+    for item, result in low_scores[:5]:
+        if item in suggestion_map:
+            suggestions.append(suggestion_map[item])
+
+    return suggestions
 
 
-def main():
-    parser = argparse.ArgumentParser(description='SEO Proofreader Tool')
+def main() -> None:
+    """Main function to run the SEO proofreader."""
+    parser = argparse.ArgumentParser(
+        description='SEO Proofreader Tool with AI')
     parser.add_argument('--doc_id', required=True, help='Google Doc ID')
-    parser.add_argument('--keywords_sheet', required=True,
-                        help='Google Sheet ID with keywords')
     parser.add_argument(
-        '--page_type', choices=['cost', 'city'], help='Force page type (optional)')
+        '--keywords_sheet',
+        required=True,
+        help='Google Sheet ID with keywords'
+    )
+    parser.add_argument(
+        '--page_type',
+        choices=['cost', 'city'],
+        help='Force page type (optional)'
+    )
 
     args = parser.parse_args()
 
-    # Authenticate with Google
+    if client.api_key:
+        print("✓ OpenAI API key found - using AI-powered evaluation")
+    else:
+        print("⚠ OpenAI API key not found - using rule-based fallbacks")
+
     docs_service, sheets_service = authenticate_google()
     if not docs_service or not sheets_service:
         return
 
-    # Read document and keywords
-    print("Reading document...")
-    text = read_document(args.doc_id, docs_service)
-    if not text:
-        print("Failed to read document")
-        return
+    try:
+        print("Reading document...")
+        text = read_document(args.doc_id, docs_service)
+        if not text:
+            print("Failed to read document")
+            return
 
-    print("Reading keywords...")
-    keywords = read_keyword_list(args.keywords_sheet, sheets_service)
-    if not keywords:
-        print("Failed to read keywords")
-        return
+        print("Reading keywords...")
+        keywords = read_keyword_list(args.keywords_sheet, sheets_service)
+        if not keywords:
+            print("Failed to read keywords")
+            return
 
-    # Detect or use specified page type
-    page_type = args.page_type or detect_page_type(text, keywords)
-    print(f"Page type: {page_type}")
+        page_type = args.page_type or detect_page_type_ai(text, keywords)
+        print(f"Page type detected: {page_type}")
 
-    # Evaluate content
-    print("Evaluating content...")
-    checklist_results = evaluate_checklist(text, keywords, page_type)
+        print("Evaluating content with AI...")
+        checklist_results = evaluate_checklist(text, keywords, page_type)
 
-    # Generate suggestions
-    print("Generating suggestions...")
-    suggestions = generate_improvement_suggestions(
-        text, keywords, checklist_results, page_type)
+        print("Generating AI-powered suggestions...")
+        suggestions = generate_ai_suggestions(
+            text, keywords, checklist_results, page_type)
 
-    # Generate report
-    print("Generating report...")
-    report = generate_report(
-        text, keywords, checklist_results, suggestions, page_type)
+        print("Generating report...")
+        report = generate_report(
+            text, keywords, checklist_results, suggestions, page_type)
 
-    # Save report
-    output_filename = f"report_{args.doc_id}.md"
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        f.write(report)
+        output_filename = f"report_{args.doc_id}.md"
+        with open(output_filename, 'w', encoding='utf-8') as output_file:
+            output_file.write(report)
 
-    print(f"Report saved as {output_filename}")
+        print(f"Report saved as {output_filename}")
+
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        raise SEOEvaluationError(
+            f"Failed to complete SEO evaluation: {e}") from e
 
 
 if __name__ == "__main__":
